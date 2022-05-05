@@ -8,6 +8,7 @@
 #include <unistd.h>
 
 #define BILLION 1000000000UL //1 second in nanoseconds
+#define MAXIMUM_PROCESSES 18
 
 unsigned int *sharedNS;
 unsigned int *sharedSecs;
@@ -20,7 +21,9 @@ struct Stats {
 };
 
 struct Pager {
-    pid_t pidArray[18];
+    pid_t pidArray[MAXIMUM_PROCESSES];
+    int page[32];
+    int mAddressReq[18];
 };
 
 void endProcess() {
@@ -34,7 +37,7 @@ void endProcess() {
     }
 
     if (shmdt(pageTbl) == -1) {
-        perror("./user_proc: endShmdtRsrc");
+        perror("./user_proc: endShmdtPage");
     }
 
     if (shmdt(statistics) == -1) {
@@ -47,11 +50,11 @@ void endProcess() {
 int main(int argc, char *argv[])
 {
     int shmid_NS, shmid_Secs, shmid_Page, shmid_Stat;
-    unsigned int creationTimeSecs, creationTimeNS, initialSharedSecs, initialSharedNS, initialTermSecs, initialTermNS, newTimeNS, termTimeNS;
+    unsigned int initialSharedSecs, initialSharedNS;
+    int pageNum, offset, termTime, termTimeRefs, referenceChecks = 0;
     int initSwitch = 1, ownedSwitch = 0, termSwitch = 1;
-    int randomRsrcPos, randomRsrcStorage;
     int resourcesObtained[10] = {0};
-    int requestChance = 40, luckyRelease = 40, terminationChance = 10;
+    int readChance = 70, terminationChance = 10;
 
     int msqid;
     int i = atoi(argv[0]);
@@ -85,7 +88,7 @@ int main(int argc, char *argv[])
 
     shmid_Page = shmget(keyRsrc, sizeof(pageTbl), IPC_CREAT | 0666);
     if (shmid_Page == -1) {
-        strcpy(report, ": shmgetRsrc");
+        strcpy(report, ": shmgetPage");
         message = strcat(title, report);
         perror(message);
         return 1;
@@ -118,7 +121,7 @@ int main(int argc, char *argv[])
 
     pageTbl = shmat(shmid_Page, NULL, 0);
     if (pageTbl == (void *) -1) {
-        strcpy(report, ": shmatRsrc");
+        strcpy(report, ": shmatPage");
         message = strcat(title, report);
         perror(message);
         return 1;
@@ -140,26 +143,58 @@ int main(int argc, char *argv[])
     //Initialize RNG
     srand(getpid() * time(NULL));
 
-    //Set time interval bounds
-    int B = 15000000; //15 milliseconds
-    int D = 250000000; //250 milliseconds
+    for (;;) {
+        //Spin until OSS responds
+        //REPLACE WITH SEMAPHORE. I SUSPECT IT'S FASTER
+        while (pageTbl->mAddressReq[i] > -1) {}
 
-    //Set creation time, so process stays alive for at least 1 second
-    creationTimeSecs = *sharedSecs;
-    creationTimeNS = *sharedSecs;
+        //Find the next period for self-termination check
+        if (termSwitch == 1) {
+            termTimeRefs = (rand() % 201) - 100; //Between -100 and 100
+            termTime = 1000 + termTimeRefs;
+            termSwitch = 0;
+        }
 
-    // for (;;) {
-    // }
+        /********************************************************************************************************************
+        At random memory references, decide whether to DIE DRAMATICALLY
+        *********************************************************************************************************************/
+        if (referenceChecks >= termTime) {
+            //Do a russian roulette dice roll
+            if ((rand() % 101) < terminationChance) {
+                //FREE MEMORY
+                pageTbl->pidArray[i] = 0;
+                endProcess();
+            }
 
-    //I would put a message here, but this is just a test... so I don't get to blow up your console like old times. :(
+            termSwitch = 1;
+            referenceChecks = 0;
+        }
 
-    endProcess();
+        /********************************************************************************************************************
+        Generate memory references
+        *********************************************************************************************************************/
+        //Get a random page
+        pageNum = rand() % 32;
+        offset = rand() % 1024;
+        pageTbl->mAddressReq[i] = (pageNum * 1024) + offset;
+
+        if ((rand() % 101) < readChance) {
+            //READ
+            //Send address and whether read/write to OSS
+        } else {
+            //WRITE
+        }
+        
+        ++referenceChecks;
+    }
 
     /**********************************************************************************
    
     End doing things here
 
     ***********************************************************************************/
+
+    endProcess();
 
     return 0;
 }

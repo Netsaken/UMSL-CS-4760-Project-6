@@ -31,6 +31,13 @@ struct Stats {
 
 struct Pager {
     pid_t pidArray[MAXIMUM_PROCESSES];
+    int page[32];
+    int mAddressReq[18];
+};
+
+struct Frame {
+    int frameNum[256];
+    int dirtyBit[256];
 };
 
 //Safely terminates program after error, interrupt, or Alarm timer
@@ -68,7 +75,7 @@ static void handle_sig(int sig) {
     }
 
     if (shmdt(pageTbl) == -1) {
-        perror("./oss: sigShmdtRsrc");
+        perror("./oss: sigShmdtPage");
     }
 
     if (shmdt(statistics) == -1) {
@@ -85,7 +92,7 @@ static void handle_sig(int sig) {
     }
 
     if (shmctl(shmid_Page, IPC_RMID, 0) == -1) {
-        perror("./oss: sigShmctlRsrc");
+        perror("./oss: sigShmctlPage");
     }
 
     if (shmctl(shmid_Stat, IPC_RMID, 0) == -1) {
@@ -156,7 +163,7 @@ int main(int argc, char *argv[])
 
     shmid_Page = shmget(keyRsrc, sizeof(pageTbl), IPC_CREAT | 0666);
     if (shmid_Page == -1) {
-        strcpy(report, ": shmgetRsrc");
+        strcpy(report, ": shmgetPage");
         message = strcat(title, report);
         perror(message);
         abort();
@@ -189,7 +196,7 @@ int main(int argc, char *argv[])
 
     pageTbl = shmat(shmid_Page, NULL, 0);
     if (pageTbl == (void *) -1) {
-        strcpy(report, ": shmatRsrc");
+        strcpy(report, ": shmatPage");
         message = strcat(title, report);
         perror(message);
         abort();
@@ -210,6 +217,12 @@ int main(int argc, char *argv[])
     *********************************************************************************/
     //End program after 2 seconds
     alarm(2);
+
+    //Initialize structures
+    struct Frame frameTbl = {0};
+    for (int i = 0; i < 18; i++) {
+        pageTbl->mAddressReq[i] = -1;
+    }
 
     //Open file (closed in handle_sig())
     file = fopen("LOGFile.txt", "w");
@@ -234,26 +247,47 @@ int main(int argc, char *argv[])
             *sharedNS -= BILLION;
         }
 
+        //fprintf(file, "Time: %li:%09li\n", (long)*sharedSecs, (long)*sharedNS);
+
+        /********************************************************************************************************************
+        Check memory address requests
+        *********************************************************************************************************************/
+        for (int m = 0; m < 18; m++) {
+            if (pageTbl->mAddressReq[m] > -1) {
+                fprintf(file, "Master: P%i requesting something at address %i, but idkwtf it wants. Resetting. Clock time is %li:%09li\n", m, pageTbl->mAddressReq[m], (long)*sharedSecs, (long)*sharedNS);
+                pageTbl->mAddressReq[m] = -1;
+            }
+        }
+
         /********************************************************************************************************************
         If the clock has hit the random time, make a new process
         *********************************************************************************************************************/
         //Before creating child, reset iInc value to the first available empty slot in table (and check if max processes has been hit)
-        // for (int j = 0; j < MAXIMUM_PROCESSES; j++) {
-        //     if (pageTbl->pidArray[j] == 0) {
-        //         iInc = j;
-        //         maxProcsHit = 0;
-        //         break;
-        //     }
-        //     maxProcsHit = 1;
-        // }
+        for (int j = 0; j < MAXIMUM_PROCESSES; j++) {
+            if (pageTbl->pidArray[j] == 0) {
+                iInc = j;
+                maxProcsHit = 0;
+                break;
+            }
+            maxProcsHit = 1;
+        }
 
         //If all processes have been terminated and new processes cannot be created, end program
-        if (hundredProcs >= 100) {
+        for (int e = 0; e < 18; e++) {
+            if (pageTbl->pidArray[e] > 0) {
+                endCheck = 0;
+                break;
+            } else {
+                endCheck = 1;
+            }
+        }
+
+        if (hundredProcs >= 100 && endCheck == 1) {
             handle_sig(2);
         }
 
         //Create child if able
-        if (hundredProcs <= 100 && maxProcsHit == 0 && (((*sharedSecs * BILLION) + *sharedNS) > ((initialTimeSecs * BILLION) + initialTimeNS + randomTimeNS))) {
+        if (hundredProcs < 100 && maxProcsHit == 0 && (((*sharedSecs * BILLION) + *sharedNS) > ((initialTimeSecs * BILLION) + initialTimeNS + randomTimeNS))) {
             //Add time to the clock
             *sharedNS += 500000; //0.5 milliseconds
             if (*sharedNS >= BILLION) {
@@ -270,7 +304,7 @@ int main(int argc, char *argv[])
                 abort();
             }
 
-            // Allocate and execute
+            //Allocate and execute
             if (childPid == 0) {
                 sprintf(iNum, "%i", iInc);
                 execl("./user_proc", iNum, NULL);

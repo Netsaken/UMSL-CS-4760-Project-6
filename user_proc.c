@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ipc.h>
+#include <sys/sem.h>
 #include <sys/shm.h>
 #include <sys/types.h>
 #include <time.h>
@@ -24,6 +25,13 @@ struct Pager {
     pid_t pidArray[MAXIMUM_PROCESSES];
     int page[32];
     int mAddressReq[18];
+};
+
+union semun {
+    int val;                /* value for SETVAL */
+    struct semid_ds *buf;   /* buffer for IPC_STAT & IPC_SET */
+    unsigned short *array;  /* array for GETALL & SETALL */
+    struct seminfo *__buf;  /* buffer for IPC_INFO */
 };
 
 void endProcess() {
@@ -54,13 +62,15 @@ int main(int argc, char *argv[])
     int pageNum, offset, termTime, termTimeRefs, referenceChecks = 0;
     int initSwitch = 1, ownedSwitch = 0, termSwitch = 1;
     int resourcesObtained[10] = {0};
-    int readChance = 70, terminationChance = 10;
+    int readChance = 70, terminationChance = 30;
 
-    int msqid;
+    int semid;
+    union semun arg;
     int i = atoi(argv[0]);
 
     key_t keyNS = ftok("./README.txt", 'Q');
     key_t keySecs = ftok("./README.txt", 'b');
+    key_t keySem = ftok("./user_proc.c", 'e');
     key_t keyRsrc = ftok("./user_proc.c", 'r');
     key_t keyStat = ftok("./user_proc.c", 't');
 
@@ -135,6 +145,14 @@ int main(int argc, char *argv[])
         return 1;
     }
 
+    //Get semaphore set
+    if ((semid = semget(keySem, 18, 0)) == -1) {
+        strcpy(report, ": semget");
+        message = strcat(title, report);
+        perror(message);
+        return 1;
+    }
+
     /********************************************************************************
 
     Start doing things here
@@ -143,10 +161,18 @@ int main(int argc, char *argv[])
     //Initialize RNG
     srand(getpid() * time(NULL));
 
+    //Initialize sembuf
+    struct sembuf sb = {i, -1, 0};
+
     for (;;) {
-        //Spin until OSS responds
-        //REPLACE WITH SEMAPHORE. I SUSPECT IT'S FASTER
-        while (pageTbl->mAddressReq[i] > -1) {}
+        //Wait until OSS responds
+        sb.sem_op = 0;
+        if(semop(semid, &sb, 1) == -1) {
+            strcpy(report, ": semop(wait)");
+            message = strcat(title, report);
+            perror(message);
+            return 1;
+        }
 
         //Find the next period for self-termination check
         if (termSwitch == 1) {
@@ -179,10 +205,23 @@ int main(int argc, char *argv[])
         pageTbl->mAddressReq[i] = (pageNum * 1024) + offset;
 
         if ((rand() % 101) < readChance) {
-            //READ
-            //Send address and whether read/write to OSS
+            //Increment own semaphore for a READ
+            sb.sem_op = 1;
+            if(semop(semid, &sb, 1) == -1) {
+                strcpy(report, ": semop(++1)");
+                message = strcat(title, report);
+                perror(message);
+                return 1;
+            }
         } else {
-            //WRITE
+            //Increment own semaphore for a WRITE
+            sb.sem_op = 2;
+            if(semop(semid, &sb, 1) == -1) {
+                strcpy(report, ": semop(++2)");
+                message = strcat(title, report);
+                perror(message);
+                return 1;
+            }
         }
         
         ++referenceChecks;

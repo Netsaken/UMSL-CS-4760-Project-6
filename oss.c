@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ipc.h>
+#include <sys/sem.h>
 #include <sys/shm.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -22,7 +23,8 @@ unsigned int *sharedNS = 0;
 unsigned int *sharedSecs = 0;
 struct Stats *statistics = {0};
 struct Pager *pageTbl = {0};
-int shmid_NS, shmid_Secs, shmid_Page, shmid_Stat;
+union semun arg;
+int shmid_NS, shmid_Secs, shmid_Page, shmid_Stat, semid;
 
 struct Stats {
     int immediateRequests, delayedRequests, deadlockTerminations, naturalTerminations, deadlockRuns;
@@ -40,6 +42,13 @@ struct Frame {
     int dirtyBit[256];
 };
 
+union semun {
+    int val;                /* value for SETVAL */
+    struct semid_ds *buf;   /* buffer for IPC_STAT & IPC_SET */
+    unsigned short *array;  /* array for GETALL & SETALL */
+    struct seminfo *__buf;  /* buffer for IPC_INFO */
+};
+
 //Safely terminates program after error, interrupt, or Alarm timer
 static void handle_sig(int sig) {
     int errsave, status;
@@ -52,6 +61,12 @@ static void handle_sig(int sig) {
     // fseek(file, 0, SEEK_CUR);
     // fflush(file);
     // fseek(file, 0, SEEK_CUR);
+
+    //Print final pidArray
+    fprintf(file, "\n");
+    for (int k = 0; k < MAXIMUM_PROCESSES; k++) {
+        fprintf(file, "%i ", pageTbl->pidArray[k]);
+    }
 
     //Close file
     fclose(file);
@@ -99,6 +114,11 @@ static void handle_sig(int sig) {
         perror("./oss: sigShmctlStat");
     }
 
+    //Remove semaphore
+    if (semctl(semid, 0, IPC_RMID, arg) == -1) {
+        perror("./oss: sigSemctl");
+    }
+
     printf("Cleanup complete!\n");
 
     //Exit program
@@ -121,10 +141,11 @@ int main(int argc, char *argv[])
 
     key_t keyNS = ftok("./README.txt", 'Q');
     key_t keySecs = ftok("./README.txt", 'b');
+    key_t keySem = ftok("./user_proc.c", 'e');
     key_t keyRsrc = ftok("./user_proc.c", 'r');
     key_t keyStat = ftok("./user_proc.c", 't');
     char iNum[3];
-    int iInc = 0, status;
+    int iInc = 0, status, semValue;
     int maxProcsHit = 0, requestCount = 0;
 
     unsigned long initialTimeNS, initialTimeSecs;
@@ -210,6 +231,25 @@ int main(int argc, char *argv[])
         abort();
     }
 
+    //Create semaphore set
+    if ((semid = semget(keySem, 18, 0666 | IPC_CREAT)) == -1) {
+        strcpy(report, ": semget");
+        message = strcat(title, report);
+        perror(message);
+        return 1;
+    }
+
+    //Initialize semaphores to 0
+    for (int s = 0; s < 18; s++) {
+        arg.val = 0;
+        if (semctl(semid, s, SETVAL, arg) == -1) {
+            strcpy(report, ": semctl(Init)");
+            message = strcat(title, report);
+            perror(message);
+            abort();
+        }
+    }
+
     /********************************************************************************
 
     Start doing things here
@@ -254,8 +294,36 @@ int main(int argc, char *argv[])
         *********************************************************************************************************************/
         for (int m = 0; m < 18; m++) {
             if (pageTbl->mAddressReq[m] > -1) {
-                fprintf(file, "Master: P%i requesting something at address %i, but idkwtf it wants. Resetting. Clock time is %li:%09li\n", m, pageTbl->mAddressReq[m], (long)*sharedSecs, (long)*sharedNS);
-                pageTbl->mAddressReq[m] = -1;
+                struct sembuf sb = {m, -1, 0};
+
+                //Check semaphore value. If it's 1, READ. If it's 2, WRITE.
+                semValue = semctl(semid, m, GETVAL, arg);
+                if (semValue == -1) {
+                    strcpy(report, ": semctl(Init)");
+                    message = strcat(title, report);
+                    perror(message);
+                    abort();
+                } else if (semValue == 1) {
+                    fprintf(file, "Master: P%i requesting to READ address %i. Clock time is %li:%09li\n", m, pageTbl->mAddressReq[m], (long)*sharedSecs, (long)*sharedNS);
+                    //Decrement semaphore (free process)
+                    sb.sem_op = -1;
+                    if (semop(semid, &sb, 1) == -1) {
+                        strcpy(report, ": semop(--1)");
+                        message = strcat(title, report);
+                        perror(message);
+                        abort();
+                    }
+                } else if (semValue == 2) {
+                    fprintf(file, "Master: P%i requesting to WRITE to address %i. Clock time is %li:%09li\n", m, pageTbl->mAddressReq[m], (long)*sharedSecs, (long)*sharedNS);
+                    //Decrement semaphore (free process)
+                    sb.sem_op = -2;
+                    if (semop(semid, &sb, 1) == -1) {
+                        strcpy(report, ": semop(--2)");
+                        message = strcat(title, report);
+                        perror(message);
+                        abort();
+                    }
+                }
             }
         }
 

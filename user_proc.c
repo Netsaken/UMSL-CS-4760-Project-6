@@ -23,7 +23,7 @@ struct Stats {
 
 struct Pager {
     pid_t pidArray[MAXIMUM_PROCESSES];
-    int page[32];
+    int page[18][32];
     int mAddressReq[18];
 };
 
@@ -58,10 +58,8 @@ void endProcess() {
 int main(int argc, char *argv[])
 {
     int shmid_NS, shmid_Secs, shmid_Page, shmid_Stat;
-    unsigned int initialSharedSecs, initialSharedNS;
-    int pageNum, offset, termTime, termTimeRefs, referenceChecks = 0;
-    int initSwitch = 1, ownedSwitch = 0, termSwitch = 1;
-    int resourcesObtained[10] = {0};
+    int pageNum, offset, termTime, termTimeRefs, referenceChecks = 0, pageInc = 0;
+    int initSwitch = 1, ownedSwitch = 0, termSwitch = 1, pageFilled = 0;
     int readChance = 70, terminationChance = 30;
 
     int semid;
@@ -187,8 +185,15 @@ int main(int argc, char *argv[])
         if (referenceChecks >= termTime) {
             //Do a russian roulette dice roll
             if ((rand() % 101) < terminationChance) {
-                //FREE MEMORY
+                //Send notification to OSS and reset pidArray
+                pageTbl->mAddressReq[i] = -2;
                 pageTbl->pidArray[i] = 0;
+
+                //Free memory
+                for (int f = 0; f < 32; f++) {
+                    pageTbl->page[i][f] = 0;
+                }
+
                 endProcess();
             }
 
@@ -201,9 +206,25 @@ int main(int argc, char *argv[])
         *********************************************************************************************************************/
         //Get a random page
         pageNum = rand() % 32;
-        offset = rand() % 1024;
-        pageTbl->mAddressReq[i] = (pageNum * 1024) + offset;
 
+        //Check if that page is already filled
+        if (pageTbl->page[i][pageNum] > 0) {
+            pageFilled = 1;
+        } else {
+            pageFilled = 0;
+        }
+
+        //If page isn't filled, set new value
+        if (pageFilled == 0) {
+            offset = rand() % 1024;
+            pageTbl->mAddressReq[i] = (pageNum * 1024) + offset;
+            pageTbl->page[i][pageInc] = pageTbl->mAddressReq[i];
+        } else {
+            //Otherwise, pass existing value from the page
+            pageTbl->mAddressReq[i] = pageTbl->page[i][pageNum];
+        }
+
+        //Decide read/write and send decision to OSS
         if ((rand() % 101) < readChance) {
             //Increment own semaphore for a READ
             sb.sem_op = 1;

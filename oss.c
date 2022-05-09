@@ -33,8 +33,9 @@ struct Stats {
 
 struct Pager {
     pid_t pidArray[MAXIMUM_PROCESSES];
-    int page[32];
+    int page[18][32];
     int mAddressReq[18];
+    int waitQueue[18];
 };
 
 struct Frame {
@@ -146,11 +147,11 @@ int main(int argc, char *argv[])
     key_t keyStat = ftok("./user_proc.c", 't');
     char iNum[3];
     int iInc = 0, status, semValue;
-    int maxProcsHit = 0, requestCount = 0;
+    int maxProcsHit = 0, requestCount = 0, pageNum, frameFIFO = 0;
 
     unsigned long initialTimeNS, initialTimeSecs;
     unsigned int randomTimeNS = 0, hundredProcs = 0;
-    int initSwitch = 1, endCheck = 0;
+    int initSwitch = 1, endCheck = 0, addFound = 0;
 
     //Format "perror"
     char* title = argv[0];
@@ -293,7 +294,7 @@ int main(int argc, char *argv[])
         Check memory address requests
         *********************************************************************************************************************/
         for (int m = 0; m < 18; m++) {
-            if (pageTbl->mAddressReq[m] > -1) {
+            if (pageTbl->mAddressReq[m] > -1 && pageTbl->waitQueue[m] != 1) {
                 struct sembuf sb = {m, -1, 0};
 
                 //Check semaphore value. If it's 1, READ. If it's 2, WRITE.
@@ -304,7 +305,36 @@ int main(int argc, char *argv[])
                     perror(message);
                     abort();
                 } else if (semValue == 1) {
-                    fprintf(file, "Master: P%i requesting to READ address %i. Clock time is %li:%09li\n", m, pageTbl->mAddressReq[m], (long)*sharedSecs, (long)*sharedNS);
+                    pageNum = pageTbl->mAddressReq[m] / 1024;
+                    fprintf(file, "Master: P%i requesting READ from address %i, page %i. Clock time is %li:%09li\n", m, pageTbl->mAddressReq[m], pageNum, (long)*sharedSecs, (long)*sharedNS);
+
+                    //Check if address is in frame
+                    for (int f = 0; f < 256; f++) {
+                        if (frameTbl.frameNum[f] == pageTbl->mAddressReq[m]) {
+                            fprintf(file, "\tAddress %i is in frame %i. Giving data to P%i at time %li:%09li\n", pageTbl->mAddressReq[m], f, m, (long)*sharedSecs, (long)*sharedNS);
+                            addFound = 1;
+                            break;
+                        }
+                    }
+
+                    if (addFound == 1) {
+                        addFound = 0;
+                    } else {
+                        fprintf(file, "\tAddress %i is not in a frame. Page fault!\n", pageTbl->mAddressReq[m]);
+                        fprintf(file, "\tClearing frame %i and swapping in P%i Page %i EVENTUALLY BUT ACTUALLY PUTTING PROCESS IN SUSPENSION\n", frameFIFO, m, pageNum);
+                        frameTbl.frameNum[frameFIFO] = pageTbl->page[m][pageNum];
+
+                        //Update next frame position for FIFO
+                        ++frameFIFO;
+                        if (frameFIFO > 255) {
+                            frameFIFO = 0; //THIS NEEDS TO BE CHANGED! FRAMES IN THE MIDDLE OF THE TABLE COULD DISAPPEAR, SO WE CAN'T ALWAYS START AT ZERO##############################################
+                        }
+                        
+                        //Put process in wait queue
+                        pageTbl->waitQueue[m] = 1;
+                        continue;
+                    }
+
                     //Decrement semaphore (free process)
                     sb.sem_op = -1;
                     if (semop(semid, &sb, 1) == -1) {
@@ -314,7 +344,37 @@ int main(int argc, char *argv[])
                         abort();
                     }
                 } else if (semValue == 2) {
-                    fprintf(file, "Master: P%i requesting to WRITE to address %i. Clock time is %li:%09li\n", m, pageTbl->mAddressReq[m], (long)*sharedSecs, (long)*sharedNS);
+                    pageNum = pageTbl->mAddressReq[m] / 1024;
+                    fprintf(file, "Master: P%i requesting WRITE to address %i, page %i. Clock time is %li:%09li\n", m, pageTbl->mAddressReq[m], pageNum, (long)*sharedSecs, (long)*sharedNS);
+
+                    //Check if address is in frame
+                    for (int f = 0; f < 256; f++) {
+                        if (frameTbl.frameNum[f] == pageTbl->mAddressReq[m]) {
+                            fprintf(file, "\tAddress %i is in frame %i. Writing data to frame at time %li:%09li\n", pageTbl->mAddressReq[m], f, (long)*sharedSecs, (long)*sharedNS);
+                            addFound = 1;
+                            break;
+                        }
+                    }
+
+                    if (addFound == 1) {
+                        addFound = 0;
+                        //ADD DIRTY BIT
+                    } else {
+                        fprintf(file, "\tAddress %i is not in a frame. Page fault!\n", pageTbl->mAddressReq[m]);
+                        fprintf(file, "\tClearing frame %i and swapping in P%i Page %i\n", frameFIFO, m, pageNum);
+                        frameTbl.frameNum[frameFIFO] = pageTbl->page[m][pageNum];
+
+                        //Update next frame position for FIFO
+                        ++frameFIFO;
+                        if (frameFIFO > 255) {
+                            frameFIFO = 0; //THIS NEEDS TO BE CHANGED! FRAMES IN THE MIDDLE OF THE TABLE COULD DISAPPEAR, SO WE CAN'T ALWAYS START AT ZERO##############################################
+                        }
+                        
+                        //Put process in wait queue
+                        pageTbl->waitQueue[m] = 1;
+                        continue;
+                    }
+
                     //Decrement semaphore (free process)
                     sb.sem_op = -2;
                     if (semop(semid, &sb, 1) == -1) {
@@ -324,6 +384,10 @@ int main(int argc, char *argv[])
                         abort();
                     }
                 }
+            } else if (pageTbl->mAddressReq[m] == -2) {
+                //Process has terminated. Pages are reset from user_proc, so just reset mAddress.
+                fprintf(file, "Master: Detecting process P%i terminated\n", m);
+                pageTbl->mAddressReq[m] = -1;
             }
         }
 

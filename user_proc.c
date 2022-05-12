@@ -17,14 +17,18 @@ struct Stats *statistics = {0};
 struct Pager *pageTbl = {0};
 
 struct Stats {
-    int immediateRequests, delayedRequests, deadlockTerminations, naturalTerminations, deadlockRuns;
-    float deadlockConsiderations, deadlockTerminationAverage;
+    float numberAccesses, numberOfPageFaults;
 };
 
 struct Pager {
     pid_t pidArray[MAXIMUM_PROCESSES];
     int page[18][32];
     int mAddressReq[18];
+    int dirtyBit[256];
+
+    int referenceChecks;
+    int waiting[18];
+    int waitQueue[18];
 };
 
 union semun {
@@ -58,9 +62,9 @@ void endProcess() {
 int main(int argc, char *argv[])
 {
     int shmid_NS, shmid_Secs, shmid_Page, shmid_Stat;
-    int pageNum, offset, termTime, termTimeRefs, referenceChecks = 0, pageInc = 0;
+    int pageNum, offset, termTime, termTimeRefs;
     int initSwitch = 1, ownedSwitch = 0, termSwitch = 1, pageFilled = 0;
-    int readChance = 70, terminationChance = 30;
+    int readChance = 70, terminationChance = 50;
 
     int semid;
     union semun arg;
@@ -175,14 +179,14 @@ int main(int argc, char *argv[])
         //Find the next period for self-termination check
         if (termSwitch == 1) {
             termTimeRefs = (rand() % 201) - 100; //Between -100 and 100
-            termTime = 1000 + termTimeRefs;
+            termTime = pageTbl->referenceChecks + 1000 + termTimeRefs;
             termSwitch = 0;
         }
 
         /********************************************************************************************************************
         At random memory references, decide whether to DIE DRAMATICALLY
         *********************************************************************************************************************/
-        if (referenceChecks >= termTime) {
+        if (pageTbl->referenceChecks >= termTime) {
             //Do a russian roulette dice roll
             if ((rand() % 101) < terminationChance) {
                 //Send notification to OSS and reset pidArray
@@ -198,7 +202,6 @@ int main(int argc, char *argv[])
             }
 
             termSwitch = 1;
-            referenceChecks = 0;
         }
 
         /********************************************************************************************************************
@@ -218,7 +221,7 @@ int main(int argc, char *argv[])
         if (pageFilled == 0) {
             offset = rand() % 1024;
             pageTbl->mAddressReq[i] = (pageNum * 1024) + offset;
-            pageTbl->page[i][pageInc] = pageTbl->mAddressReq[i];
+            pageTbl->page[i][pageNum] = pageTbl->mAddressReq[i];
         } else {
             //Otherwise, pass existing value from the page
             pageTbl->mAddressReq[i] = pageTbl->page[i][pageNum];
@@ -245,7 +248,7 @@ int main(int argc, char *argv[])
             }
         }
         
-        ++referenceChecks;
+        ++statistics->numberAccesses;
     }
 
     /**********************************************************************************

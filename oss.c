@@ -27,20 +27,23 @@ union semun arg;
 int shmid_NS, shmid_Secs, shmid_Page, shmid_Stat, semid;
 
 struct Stats {
-    int immediateRequests, delayedRequests, deadlockTerminations, naturalTerminations, deadlockRuns;
-    float deadlockConsiderations, deadlockTerminationAverage;
+    float numberAccesses, numberOfPageFaults;
 };
 
 struct Pager {
     pid_t pidArray[MAXIMUM_PROCESSES];
     int page[18][32];
     int mAddressReq[18];
+    int dirtyBit[256];
+
+    int referenceChecks;
+    int waiting[18];
     int waitQueue[18];
 };
 
 struct Frame {
     int frameNum[256];
-    int dirtyBit[256];
+    int frameOwnership[256];
 };
 
 union semun {
@@ -59,15 +62,33 @@ static void handle_sig(int sig) {
     printf("Program finished or interrupted. Cleaning up...\n");
 
     //Output statistics
-    // fseek(file, 0, SEEK_CUR);
-    // fflush(file);
-    // fseek(file, 0, SEEK_CUR);
+    fprintf(file, "\nMemory Accesses per Simulated Second: %f\n", statistics->numberAccesses / *sharedSecs);
+    fprintf(file, "Total Page Faults: %f\n", statistics->numberOfPageFaults);
+    fprintf(file, "Number of Page Faults per Memory Access: %f", statistics->numberOfPageFaults / statistics->numberAccesses);
+    fseek(file, 0, SEEK_CUR);
+    fflush(file);
+    fseek(file, 0, SEEK_CUR);
 
-    //Print final pidArray
-    fprintf(file, "\n");
-    for (int k = 0; k < MAXIMUM_PROCESSES; k++) {
-        fprintf(file, "%i ", pageTbl->pidArray[k]);
-    }
+    //Print tables under review
+    // fprintf(file, "\n");
+    // for (int k = 0; k < MAXIMUM_PROCESSES; k++) {
+    //     fprintf(file, "%i ", pageTbl->pidArray[k]);
+    // }
+    // fprintf(file, "\nQueued: ");
+    // for (int k = 0; k < MAXIMUM_PROCESSES; k++) {
+    //     fprintf(file, "%i ", pageTbl->waitQueue[k]);
+    // }
+    // fprintf(file, "\nWaiting: ");
+    // for (int k = 0; k < MAXIMUM_PROCESSES; k++) {
+    //     fprintf(file, "%i ", pageTbl->waiting[k]);
+    // }
+    // fprintf(file, "\nPage: ");
+    // for (int k = 0; k < MAXIMUM_PROCESSES; k++) {
+    //     for (int p = 0; p < 32; p++) {
+    //         fprintf(file, "%i ", pageTbl->page[k][p]);
+    //     }
+    //     fprintf(file, "\n");
+    // }
 
     //Close file
     fclose(file);
@@ -134,6 +155,33 @@ static int setupinterrupt(void) {
     return (sigemptyset(&act.sa_mask) || sigaction(SIGALRM, &act, NULL));
 }
 
+//Add to the back of the queue
+void queueAdd(int p) {
+    bool notAdded = false;
+    for (int i = 0; i < 18; i++) {
+        if (pageTbl->waitQueue[i] == 0) {
+            pageTbl->waitQueue[i] = p;
+            notAdded = false;
+            break;
+        } else {
+            notAdded = true;
+        }
+    }
+
+    if (notAdded == true) {
+        printf("ERROR: queueAdd invoked at maximum size!\n");
+        abort();
+    }
+}
+
+//Remove from the front of the queue, then shift all values 1 space to the left
+void queueRemove() {
+    for (int i = 0; i < 17; i++) {
+        pageTbl->waitQueue[i] = pageTbl->waitQueue[i + 1];
+    }
+    pageTbl->waitQueue[17] = 0;
+}
+
 int main(int argc, char *argv[])
 {
     signal(SIGINT, handle_sig);
@@ -147,11 +195,11 @@ int main(int argc, char *argv[])
     key_t keyStat = ftok("./user_proc.c", 't');
     char iNum[3];
     int iInc = 0, status, semValue;
-    int maxProcsHit = 0, requestCount = 0, pageNum, frameFIFO = 0;
+    int maxProcsHit = 0, requestCount = 0, pageNum, frameFIFO = 0, readOrWriteSem;
 
-    unsigned long initialTimeNS, initialTimeSecs;
+    unsigned long initialTimeNS, initialTimeSecs, initFulSecs, initFulNS, fulfillTimeNS, printTableSecs;
     unsigned int randomTimeNS = 0, hundredProcs = 0;
-    int initSwitch = 1, endCheck = 0, addFound = 0;
+    int initSwitch = 1, waitSwitch = 1, endCheck = 0, addFound = 0, dirtyFound = 0, printTableSwitch = 1;
 
     //Format "perror"
     char* title = argv[0];
@@ -262,6 +310,7 @@ int main(int argc, char *argv[])
     //Initialize structures
     struct Frame frameTbl = {0};
     for (int i = 0; i < 18; i++) {
+        pageTbl->waiting[i] = -1;
         pageTbl->mAddressReq[i] = -1;
     }
 
@@ -281,6 +330,22 @@ int main(int argc, char *argv[])
             initSwitch = 0;
         }
 
+        //Set next time interval for the wait queue (if not already set)
+        if (waitSwitch == 1) {
+            initFulSecs = *sharedSecs;
+            initFulNS = *sharedNS;
+
+            fulfillTimeNS = 14000000; //14 milliseconds
+            waitSwitch = 0;
+        }
+
+        //Set time interval for displaying the memory map
+        if (printTableSwitch == 1) {
+            printTableSecs = *sharedSecs + 1;
+
+            printTableSwitch = 0;
+        }
+
         //Add ambient time to the clock
         *sharedNS += 100000; //0.1 milliseconds
         if (*sharedNS >= BILLION) {
@@ -288,14 +353,20 @@ int main(int argc, char *argv[])
             *sharedNS -= BILLION;
         }
 
-        //fprintf(file, "Time: %li:%09li\n", (long)*sharedSecs, (long)*sharedNS);
-
         /********************************************************************************************************************
         Check memory address requests
         *********************************************************************************************************************/
         for (int m = 0; m < 18; m++) {
-            if (pageTbl->mAddressReq[m] > -1 && pageTbl->waitQueue[m] != 1) {
+            if (pageTbl->mAddressReq[m] > -1 && pageTbl->waiting[m] == -1) {
                 struct sembuf sb = {m, -1, 0};
+                ++pageTbl->referenceChecks;
+
+                //Add time to the clock
+                *sharedNS += 10; //10 nanoseconds
+                if (*sharedNS >= BILLION) {
+                    *sharedSecs += 1;
+                    *sharedNS -= BILLION;
+                }
 
                 //Check semaphore value. If it's 1, READ. If it's 2, WRITE.
                 semValue = semctl(semid, m, GETVAL, arg);
@@ -320,18 +391,12 @@ int main(int argc, char *argv[])
                     if (addFound == 1) {
                         addFound = 0;
                     } else {
-                        fprintf(file, "\tAddress %i is not in a frame. Page fault!\n", pageTbl->mAddressReq[m]);
-                        fprintf(file, "\tClearing frame %i and swapping in P%i Page %i EVENTUALLY BUT ACTUALLY PUTTING PROCESS IN SUSPENSION\n", frameFIFO, m, pageNum);
-                        frameTbl.frameNum[frameFIFO] = pageTbl->page[m][pageNum];
-
-                        //Update next frame position for FIFO
-                        ++frameFIFO;
-                        if (frameFIFO > 255) {
-                            frameFIFO = 0; //THIS NEEDS TO BE CHANGED! FRAMES IN THE MIDDLE OF THE TABLE COULD DISAPPEAR, SO WE CAN'T ALWAYS START AT ZERO##############################################
-                        }
-                        
-                        //Put process in wait queue
-                        pageTbl->waitQueue[m] = 1;
+                        fprintf(file, "\tAddress %i is not in a frame. PAGE FAULT. Suspending P%i.\n", pageTbl->mAddressReq[m], m);
+                        ++statistics->numberOfPageFaults;
+                     
+                        //Put request in wait slot, put process in wait queue
+                        pageTbl->waiting[m] = pageNum;
+                        queueAdd(m + 100); //Adding 100 to number to grab semaphore value later
                         continue;
                     }
 
@@ -351,6 +416,9 @@ int main(int argc, char *argv[])
                     for (int f = 0; f < 256; f++) {
                         if (frameTbl.frameNum[f] == pageTbl->mAddressReq[m]) {
                             fprintf(file, "\tAddress %i is in frame %i. Writing data to frame at time %li:%09li\n", pageTbl->mAddressReq[m], f, (long)*sharedSecs, (long)*sharedNS);
+
+                            fprintf(file, "\tDirty bit set in frame %i\n", f);
+                            pageTbl->dirtyBit[f] = 1;
                             addFound = 1;
                             break;
                         }
@@ -358,20 +426,13 @@ int main(int argc, char *argv[])
 
                     if (addFound == 1) {
                         addFound = 0;
-                        //ADD DIRTY BIT
                     } else {
-                        fprintf(file, "\tAddress %i is not in a frame. Page fault!\n", pageTbl->mAddressReq[m]);
-                        fprintf(file, "\tClearing frame %i and swapping in P%i Page %i\n", frameFIFO, m, pageNum);
-                        frameTbl.frameNum[frameFIFO] = pageTbl->page[m][pageNum];
-
-                        //Update next frame position for FIFO
-                        ++frameFIFO;
-                        if (frameFIFO > 255) {
-                            frameFIFO = 0; //THIS NEEDS TO BE CHANGED! FRAMES IN THE MIDDLE OF THE TABLE COULD DISAPPEAR, SO WE CAN'T ALWAYS START AT ZERO##############################################
-                        }
+                        fprintf(file, "\tAddress %i is not in a frame. PAGE FAULT. Suspending P%i.\n", pageTbl->mAddressReq[m], m);
+                        ++statistics->numberOfPageFaults;
                         
-                        //Put process in wait queue
-                        pageTbl->waitQueue[m] = 1;
+                        //Put request in wait slot, put process in wait queue
+                        pageTbl->waiting[m] = pageNum;
+                        queueAdd(m + 200); //Adding 200 to number to grab semaphore value later
                         continue;
                     }
 
@@ -385,9 +446,78 @@ int main(int argc, char *argv[])
                     }
                 }
             } else if (pageTbl->mAddressReq[m] == -2) {
-                //Process has terminated. Pages are reset from user_proc, so just reset mAddress.
-                fprintf(file, "Master: Detecting process P%i terminated\n", m);
+                //Process has terminated. Pages are reset from user_proc, so just reset mAddress AND FRAMES
+                fprintf(file, "Master: Detecting process P%i terminated. Freeing frames.\n", m);
                 pageTbl->mAddressReq[m] = -1;
+
+                for (int r = 0; r < 256; r++) {
+                    if (frameTbl.frameOwnership[r] == m) {
+                        frameTbl.frameNum[r] = 0;
+                        pageTbl->dirtyBit[r] = 0;
+                        frameTbl.frameOwnership[r] = 0;
+                    }
+                }
+            }
+        }
+
+        /********************************************************************************************************************
+        Fulfill request at the head of Wait queue every 14 ms
+        *********************************************************************************************************************/
+        //Swap page, remove from wait slot and wait queue
+        if (pageTbl->waitQueue[0] != 0) {
+            if (((*sharedSecs * BILLION) + *sharedNS) >= ((initFulSecs * BILLION) + initFulNS + fulfillTimeNS)) {
+                //Get, and separate, semaphore value
+                if (pageTbl->waitQueue[0] < 200) {
+                    readOrWriteSem = pageTbl->waitQueue[0] / 100;
+                    pageTbl->waitQueue[0] = pageTbl->waitQueue[0] % 100;
+                } else {
+                    readOrWriteSem = pageTbl->waitQueue[0] / 200;
+                    pageTbl->waitQueue[0] = pageTbl->waitQueue[0] % 200;
+                    dirtyFound = 1;
+                }
+
+                //Print message
+                fprintf(file, "Master: Clearing frame %i and swapping in P%i Page %i\n", frameFIFO, pageTbl->waitQueue[0], pageTbl->waiting[pageTbl->waitQueue[0]]);
+                frameTbl.frameNum[frameFIFO] = pageTbl->page[pageTbl->waitQueue[0]][pageTbl->waiting[pageTbl->waitQueue[0]]];
+                frameTbl.frameOwnership[frameFIFO] = pageTbl->waitQueue[0];
+
+                //Deal with dirty bit if this was a write
+                if (dirtyFound == 1) {
+                    fprintf(file, "\tWrite detected. Dirty bit set in frame %i, adding additional time to the clock\n", frameFIFO);
+                    pageTbl->dirtyBit[frameFIFO] = 1;
+
+                    //Add time to the clock
+                    *sharedNS += 1000000; //1 millisecond
+                    if (*sharedNS >= BILLION) {
+                        *sharedSecs += 1;
+                        *sharedNS -= BILLION;
+                    }
+                }
+
+                fprintf(file, "\tRemoving P%i from wait queue at time %li:%09li\n", pageTbl->waitQueue[0], (long)*sharedSecs, (long)*sharedNS);
+
+                //Update next frame position for FIFO
+                ++frameFIFO;
+                if (frameFIFO > 255) {
+                    frameFIFO = 0;
+                }
+
+                //Decrement semaphore (free process)
+                struct sembuf sb = {pageTbl->waitQueue[0], -1, 0};
+                sb.sem_op = -readOrWriteSem;
+                if (semop(semid, &sb, 1) == -1) {
+                    strcpy(report, ": semop(--2)");
+                    message = strcat(title, report);
+                    perror(message);
+                    abort();
+                }
+
+                //Clear waits
+                pageTbl->waiting[pageTbl->waitQueue[0]] = -1;
+                queueRemove();
+
+                dirtyFound = 0;
+                waitSwitch = 1;
             }
         }
 
@@ -419,7 +549,7 @@ int main(int argc, char *argv[])
         }
 
         //Create child if able
-        if (hundredProcs < 100 && maxProcsHit == 0 && (((*sharedSecs * BILLION) + *sharedNS) > ((initialTimeSecs * BILLION) + initialTimeNS + randomTimeNS))) {
+        if (hundredProcs < 100 && maxProcsHit == 0 && (((*sharedSecs * BILLION) + *sharedNS) >= ((initialTimeSecs * BILLION) + initialTimeNS + randomTimeNS))) {
             //Add time to the clock
             *sharedNS += 500000; //0.5 milliseconds
             if (*sharedNS >= BILLION) {
@@ -445,7 +575,7 @@ int main(int argc, char *argv[])
                 pageTbl->pidArray[iInc] = childPid;
 
                 // Log to file
-                fprintf(file, "Master creating new Process P%i(%i) at clock time %li:%09li\n", iInc, ++totP, (long)*sharedSecs, (long)*sharedNS);
+                fprintf(file, "Master: Creating new Process P%i(%i) at clock time %li:%09li\n", iInc, ++totP, (long)*sharedSecs, (long)*sharedNS);
             }
 
             //Add to total process count
@@ -453,6 +583,19 @@ int main(int argc, char *argv[])
 
             //Reset switch
             initSwitch = 1;
+        }
+
+        /********************************************************************************************************************
+        Print memory map every second
+        *********************************************************************************************************************/
+        if (*sharedSecs > printTableSecs) {
+            fprintf(file, "Current memory layout at time %li:%09li\n", (long)*sharedSecs, (long)*sharedNS);
+            fprintf(file, "\t\tOccupied\tDirty Bit\n");
+            for (int p = 0; p < 256; p++) {
+                fprintf(file, "Frame %i:\t%s\t\t%i\n", p, frameTbl.frameNum[p] > 0 ? "Yes" : "No", pageTbl->dirtyBit[p]);
+            }
+
+            printTableSwitch = 1;
         }
     }
 

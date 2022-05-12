@@ -449,6 +449,7 @@ int main(int argc, char *argv[])
                 //Process has terminated. Pages are reset from user_proc, so just reset mAddress AND FRAMES
                 fprintf(file, "Master: Detecting process P%i terminated. Freeing frames.\n", m);
                 pageTbl->mAddressReq[m] = -1;
+                waitpid(pageTbl->pidArray[m], &status, 0);
 
                 for (int r = 0; r < 256; r++) {
                     if (frameTbl.frameOwnership[r] == m) {
